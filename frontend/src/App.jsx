@@ -16,6 +16,7 @@ const API_STATUS = {
 
 function App() {
   const { theme } = useContext(ThemeContext);
+  const [expandedFolders, setExpandedFolders] = useState({});
   const [githubUrl, setGithubUrl] = useState('');
   const [uiState, setUiState] = useState('welcome'); // welcome, loading, file-selection, chat
   const [statusMessage, setStatusMessage] = useState('');
@@ -391,6 +392,14 @@ function App() {
     return result;
   };
 
+  // Helper function to toggle folder expansion
+  const toggleFolder = (folderPath) => {
+    setExpandedFolders(prev => ({
+      ...prev,
+      [folderPath]: !prev[folderPath]
+    }));
+  };
+
   // Helper function to render folder structure recursively
   const renderFolderTree = (structure, path = "", indent = 0) => {
     return Object.entries(structure).map(([key, value]) => {
@@ -414,21 +423,17 @@ function App() {
         // It's a folder
         const currentPath = path ? `${path}/${key}` : key;
         
+        // Get expanded state from top-level state
+        const isExpanded = expandedFolders[currentPath] === undefined 
+          ? true 
+          : expandedFolders[currentPath];
+        
         // Count files in this folder
         const filesInFolder = countFilesInFolder(value);
         
         // Get all file paths in this folder for select/deselect operations
         const filePaths = [];
         getFilePaths(value, filePaths);
-        
-        // Is folder expanded (default to true)
-        const [isExpanded, setIsExpanded] = useState(true);
-        
-        // Toggle folder expansion
-        const toggleFolder = (e) => {
-          e.stopPropagation();
-          setIsExpanded(!isExpanded);
-        };
         
         // Handle folder selection (select/deselect all files in folder)
         const handleFolderSelect = () => {
@@ -460,7 +465,10 @@ function App() {
             >
               <button 
                 className={`folder-toggle ${isExpanded ? 'expanded' : ''}`}
-                onClick={toggleFolder}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleFolder(currentPath);
+                }}
                 aria-label={isExpanded ? 'Collapse folder' : 'Expand folder'}
                 aria-expanded={isExpanded}
               >

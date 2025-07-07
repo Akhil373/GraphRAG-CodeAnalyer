@@ -8,7 +8,10 @@ from neo4j.exceptions import ServiceUnavailable, Neo4jError
 import vertexai
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.generative_models import GenerativeModel
-from google.api_core.exceptions import GoogleAPIError # For more general Vertex AI/Google Cloud errors
+from google.api_core.exceptions import GoogleAPIError
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -51,7 +54,7 @@ if not NEO4J_PASSWORD:
 # Initialize Vertex AI
 try:
     vertexai.init(project=GCP_PROJECT_ID, location="us-central1")
-    embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
+    embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-large-exp-03-07")
     generative_model = GenerativeModel("gemini-2.5-flash")
     app.logger.info(f"Vertex AI initialized for project '{GCP_PROJECT_ID}' in region '{GCP_REGION}'.")
 except GoogleAPIError as e:
@@ -93,43 +96,71 @@ def get_neo4j_driver():
 
 def create_vector_indexes(driver):
     """
-    Checks for and creates GDS vector indexes if they do not exist.
+    Ensure that the required GDS vector indexes exist **and** are configured with
+    the correct dimensionality for the current embedding model. If an index
+    already exists but its configured `vector.dimensions` does not match the
+    expected size (3072), the index will be dropped and recreated with the
+    correct settings. This prevents runtime errors such as:
+        "Index query vector has 3072 dimensions, but indexed vectors have 768."
     """
-    index_queries = {
-        "file_index": """
+
+    # Desired dimensionality based on the active embedding model
+    desired_dim = 3072
+
+    # Cypher templates to (re)create the indexes
+    index_creation_queries = {
+        "file_index": f"""
             CREATE VECTOR INDEX `file_index` IF NOT EXISTS
             FOR (f:File) ON (f.embedding)
-            OPTIONS {indexConfig: {
-                `vector.dimensions`: 768,
-                `vector.similarity_function`: 'cosine'
+            OPTIONS {{
+                indexConfig: {{
+                    `vector.dimensions`: {desired_dim},
+                    `vector.similarity_function`: 'cosine'
+                }}
             }}
         """,
-        "function_index": """
+        "function_index": f"""
             CREATE VECTOR INDEX `function_index` IF NOT EXISTS
             FOR (func:Function) ON (func.embedding)
-            OPTIONS {indexConfig: {
-                `vector.dimensions`: 768,
-                `vector.similarity_function`: 'cosine'
+            OPTIONS {{
+                indexConfig: {{
+                    `vector.dimensions`: {desired_dim},
+                    `vector.similarity_function`: 'cosine'
+                }}
             }}
         """
     }
+
     try:
         with driver.session() as session:
-            for index_name, query in index_queries.items():
-                app.logger.info(f"Checking for GDS vector index: {index_name}")
-                session.run(query)
-                app.logger.info(f"GDS vector index '{index_name}' is ready.")
+            # First, try to drop existing indexes to ensure clean recreation
+            try:
+                # Use SHOW INDEXES command which is supported in AuraDB
+                existing_indexes = session.run("SHOW INDEXES WHERE name in ['file_index', 'function_index']").data()
+                
+                # Drop existing indexes if they exist
+                for index in existing_indexes:
+                    index_name = index.get('name')
+                    if index_name:
+                        app.logger.info(f"Dropping existing index: {index_name}")
+                        session.run(f"DROP INDEX {index_name}")
+            except Exception as e:
+                app.logger.warning(f"Could not check or drop existing indexes: {e}")
+                
+            # Create new indexes with the correct dimensions
+            for index_name, create_query in index_creation_queries.items():
+                app.logger.info(f"Creating vector index '{index_name}' with dimension {desired_dim}...")
+                session.run(create_query)
+                app.logger.info(f"Vector index '{index_name}' created successfully.")
+                
     except Neo4jError as e:
         app.logger.error(
-            f"Failed to create or verify GDS vector index. "
-            f"Please ensure the GDS plugin is installed in Neo4j. Error: {e}",
-            exc_info=True
+            "Failed to create or verify GDS vector index. Please ensure the GDS plugin is installed in Neo4j. Error: %s",
+            e,
+            exc_info=True,
         )
-        # Depending on the application's requirements, you might want to
-        # raise an exception here to prevent the app from starting without the indexes.
-        # For now, we'll log it as an error and continue.
     except Exception as e:
-        app.logger.error(f"An unexpected error occurred during index creation: {e}", exc_info=True)
+        app.logger.error("An unexpected error occurred during index creation: %s", e, exc_info=True)
 
 # --- Global Error Handlers ---
 @app.errorhandler(400)
@@ -194,31 +225,119 @@ def generate_embeddings(text):
 
 def retrieve_graph_context(query_embedding, user_query, session):
     """
-    Retrieves relevant context from the Neo4j graph using vector search and Cypher queries.
-    Enhanced with more sophisticated queries and better context extraction.
+    Retrieves relevant context from the Neo4j graph using hybrid vector search + graph traversal.
     """
     context = []
     
     try:
         # --- 1. Vector Search (Primary Method) ---
-        # Use vector search to find relevant entities
-        entity_query = """
+        app.logger.info("Executing entity vector search query...")
+        
+        # Search function index
+        function_query = """
         CALL db.index.vector.queryNodes('function_index', 5, $query_embedding) YIELD node, score
         WHERE score > 0.6 AND node.file_path IS NOT NULL
         RETURN node.name AS name, labels(node)[0] as type, node.file_path AS filePath, 
-               node.description as description, score
+               node.description as description, node.context_sample as code, score
         ORDER BY score DESC
         """
-        app.logger.info("Executing entity vector search query...")
-        entity_results = session.run(entity_query, query_embedding=query_embedding).data()
+        function_results = session.run(function_query, query_embedding=query_embedding).data()
+        
+        # Search file index
+        file_query = """
+        CALL db.index.vector.queryNodes('file_index', 5, $query_embedding) YIELD node, score
+        WHERE score > 0.6
+        RETURN node.name AS name, labels(node)[0] as type, node.path AS filePath, 
+               node.description as description, score, node.context_sample as code
+        ORDER BY score DESC
+        """
+        file_results = session.run(file_query, query_embedding=query_embedding).data()
+        
+        # Combine results
+        entity_results = function_results + file_results
+        entity_ids = [f"{res['name']}-{res['filePath']}" for res in entity_results]
         
         for res in entity_results:
             entity_type = res.get('type', 'Entity')
-            context.append(f"In file '{res['filePath']}', there is a {entity_type.lower()} called '{res['name']}'. {res['description']}")
+            file_path = res.get('filePath', 'unknown path')
+            description = res.get('description', '')
+            
+            # Include code sample if available
+            code_sample = res.get('code', '')
+            if code_sample:
+                context.append(f"In file '{file_path}', there is a {entity_type.lower()} called '{res['name']}'. {description}\nCode:\n```\n{code_sample}\n```")
+            else:
+                context.append(f"In file '{file_path}', there is a {entity_type.lower()} called '{res['name']}'. {description}")
         
         app.logger.info(f"Found {len(entity_results)} entity contexts via vector search.")
         
-        # --- 2. Keyword Search (Complementary Method) ---
+        # --- 2. Graph Traversal Expansion ---
+        if entity_results:
+            app.logger.info("Expanding context via graph traversal...")
+            traversal_query = """
+            UNWIND $entityIds AS entityId
+            WITH split(entityId, '-')[0] AS name, split(entityId, '-')[1] AS filePath
+            MATCH (start)
+            WHERE (start:Function AND start.name = name AND start.file_path = filePath)
+               OR (start:File AND start.path = filePath)
+            CALL apoc.path.expandConfig(start, {
+                relationshipFilter: "CALLS|USES|DEFINES|CONTAINS|IMPORTS|DEPENDS_ON|READS_FROM|WRITES_TO",
+                minLevel: 1,
+                maxLevel: 2,
+                uniqueness: "NODE_GLOBAL"
+            }) YIELD path
+            WITH last(nodes(path)) AS node, start
+            WHERE node <> start
+            RETURN DISTINCT node.name AS name, labels(node)[0] as type, 
+                   coalesce(node.file_path, node.path) AS filePath,
+                   node.description as description, node.context_sample as code
+            LIMIT 20
+            """
+            traversal_results = session.run(traversal_query, entityIds=entity_ids).data()
+            
+            for res in traversal_results:
+                entity_type = res.get('type', 'Entity')
+                file_path = res.get('filePath', 'unknown path')
+                description = res.get('description', '')
+                code_sample = res.get('code', '')
+                if code_sample:
+                    context.append(f"Via graph traversal: In file '{file_path}', there is a {entity_type.lower()} called '{res['name']}'. {description}\nCode:\n```\n{code_sample}\n```")
+                else:
+                    context.append(f"Via graph traversal: In file '{file_path}', there is a {entity_type.lower()} called '{res['name']}'. {description}")
+        
+        # --- 3. Shortest Path Connections ---
+        if len(entity_results) >= 2:
+            app.logger.info("Finding connections between top entities...")
+            top_entities = [res['name'] for res in entity_results[:2]]
+            path_query = """
+            MATCH (a), (b)
+            WHERE a.name = $entity1 AND b.name = $entity2
+            CALL apoc.algo.allSimplePaths(a, b, null, 3) YIELD path
+            WITH path, length(path) AS length
+            ORDER BY length ASC
+            LIMIT 3
+            UNWIND nodes(path) AS node
+            RETURN DISTINCT node.name AS name, labels(node)[0] as type, 
+                   coalesce(node.file_path, node.path) AS filePath,
+                   node.description as description, node.context_sample as code
+            """
+            path_results = session.run(
+                path_query, 
+                entity1=top_entities[0], 
+                entity2=top_entities[1]
+            ).data()
+            
+            for res in path_results:
+                entity_type = res.get('type', 'Entity')
+                file_path = res.get('filePath', 'unknown path')
+                description = res.get('description', '')
+                code_sample = res.get('code', '')
+                if code_sample:
+                    context.append(f"Via path connection: In file '{file_path}', there is a {entity_type.lower()} called '{res['name']}'. {description}\nCode:\n```\n{code_sample}\n```")
+                else:
+                    context.append(f"Via path connection: In file '{file_path}', there is a {entity_type.lower()} called '{res['name']}'. {description}")
+        
+        # --- 4. Keyword Search (Complementary Method) ---
         # Extract keywords from the user query
         keywords = [word.lower() for word in user_query.split() if len(word) > 2]
         keywords = [word for word in keywords if word not in 
@@ -230,7 +349,7 @@ def retrieve_graph_context(query_embedding, user_query, session):
             MATCH (n)
             WHERE (ANY(keyword IN $keywords WHERE toLower(n.name) CONTAINS keyword))
             RETURN n.name as name, labels(n)[0] as type, n.file_path as filePath, 
-                   n.description as description
+                   n.description as description, n.context_sample as code
             LIMIT 5
             """
             app.logger.info("Executing keyword name search...")
@@ -238,14 +357,19 @@ def retrieve_graph_context(query_embedding, user_query, session):
             
             for res in name_results:
                 entity_type = res.get('type', 'Entity')
-                context.append(f"Found a {entity_type.lower()} named '{res['name']}' in '{res['filePath']}' that matches your query. {res['description']}")
+                description = res.get('description', '')
+                code_sample = res.get('code', '')
+                if code_sample:
+                    context.append(f"Found a {entity_type.lower()} named '{res['name']}' in '{res['filePath']}' that matches your query. {description}\nCode:\n```\n{code_sample}\n```")
+                else:
+                    context.append(f"Found a {entity_type.lower()} named '{res['name']}' in '{res['filePath']}' that matches your query. {description}")
             
             # Search for entities by description
             desc_query = """
             MATCH (n)
             WHERE (ANY(keyword IN $keywords WHERE toLower(n.description) CONTAINS keyword))
             RETURN n.name as name, labels(n)[0] as type, n.file_path as filePath, 
-                   n.description as description
+                   n.description as description, n.context_sample as code
             LIMIT 5
             """
             app.logger.info("Executing keyword description search...")
@@ -253,41 +377,24 @@ def retrieve_graph_context(query_embedding, user_query, session):
             
             for res in desc_results:
                 entity_type = res.get('type', 'Entity')
-                context.append(f"The {entity_type.lower()} '{res['name']}' in '{res['filePath']}' appears relevant to your question. {res['description']}")
-        
-        # --- 3. Relationship Exploration ---
-        # If we found entities, explore their relationships
-        if entity_results:
-            top_entity = entity_results[0]
-            entity_name = top_entity['name']
-            entity_file = top_entity['filePath']
-            
-            # Find relationships for the top entity
-            rel_query = """
-            MATCH (n {name: $name, file_path: $filePath})-[r]->(m)
-            RETURN n.name as source, type(r) as relationship, m.name as target, 
-                   labels(m)[0] as targetType, r.context as context
-            UNION
-            MATCH (n)<-[r]-(m {name: $name, file_path: $filePath})
-            RETURN m.name as source, type(r) as relationship, n.name as target, 
-                   labels(n)[0] as targetType, r.context as context
-            LIMIT 8
-            """
-            app.logger.info(f"Exploring relationships for entity: {entity_name}")
-            rel_results = session.run(rel_query, name=entity_name, filePath=entity_file).data()
-            
-            for res in rel_results:
-                rel_context = res.get('context', '')
-                relationship = res['relationship'].lower().replace('_', ' ')
-                if rel_context:
-                    context.append(f"'{res['source']}' {relationship} '{res['target']}'. {rel_context}")
+                description = res.get('description', '')
+                code_sample = res.get('code', '')
+                if code_sample:
+                    context.append(f"The {entity_type.lower()} '{res['name']}' in '{res['filePath']}' appears relevant to your question. {description}\nCode:\n```\n{code_sample}\n```")
                 else:
-                    context.append(f"'{res['source']}' {relationship} '{res['target']}'.")
+                    context.append(f"The {entity_type.lower()} '{res['name']}' in '{res['filePath']}' appears relevant to your question. {description}")
         
-        # --- 4. File Context ---
+        # --- 5. File Context ---
         # Get information about the files containing the entities
         if entity_results:
-            file_paths = list(set([res['filePath'] for res in entity_results if 'filePath' in res]))
+            # Collect file paths, handling both file_path and path properties
+            file_paths = []
+            for res in entity_results:
+                if 'filePath' in res and res['filePath']:
+                    file_paths.append(res['filePath'])
+            
+            file_paths = list(set(file_paths))  # Remove duplicates
+            
             if file_paths:
                 # Use a more comprehensive query to get file information
                 file_query = """
@@ -295,8 +402,8 @@ def retrieve_graph_context(query_embedding, user_query, session):
                 WHERE (f:File OR f:SourceFile OR f:PythonModule OR f:JavaScriptModule OR f:CobolProgram 
                        OR f:SasProgram OR f:JclJob OR f:FlinkJob OR f:DataFile OR f:CppFile 
                        OR f:FortranProgram OR f:PliProgram OR f:AssemblyFile OR f:RpgProgram)
-                AND f.path IN $filePaths
-                RETURN f.path as path, f.repo_id as repoId, labels(f) as fileLabels
+                AND (f.path IN $filePaths OR f.file_path IN $filePaths)
+                RETURN COALESCE(f.path, f.file_path) as path, f.repo_id as repoId, labels(f) as fileLabels
                 """
                 app.logger.info(f"Getting file context for {len(file_paths)} files")
                 file_results = session.run(file_query, filePaths=file_paths).data()
@@ -315,7 +422,7 @@ def retrieve_graph_context(query_embedding, user_query, session):
                     # Get other entities in the same file with improved query
                     file_entities_query = """
                     MATCH (f)-[:CONTAINS]->(e)
-                    WHERE f.path = $path
+                    WHERE f.path = $path OR f.file_path = $path
                     RETURN e.name as name, labels(e)[0] as type
                     LIMIT 8
                     """
@@ -372,6 +479,11 @@ def chat_with_graph():
             graph_context = retrieve_graph_context(query_embedding, user_query, session)
             app.logger.info(f"Graph context retrieved: {'Context found' if graph_context else 'No context found'}")
 
+            # Print the human-readable context to the terminal
+            print("\n===== Context sent to Gemini =====\n")
+            print(graph_context)
+            print("\n==================================================\n")
+
         # Format conversation history for the prompt
         conversation_context = ""
         if conversation_history:
@@ -382,15 +494,22 @@ def chat_with_graph():
                 conversation_context += f"{role.capitalize()}: {content}\n"
             
         prompt = f"""
-        You are an AI assistant specialized in analyzing and explaining codebases based on a knowledge graph.
-        Your task is to provide clear, accurate, and helpful information about code structure, functionality, and relationships in natural, conversational language.
-        
-        Important formatting guidelines:
-        1. Respond in plain, conversational English - avoid bullet points and numbered lists unless absolutely necessary
-        2. Format your response as a cohesive narrative rather than technical documentation
-        3. Use paragraphs to organize information, not lists or technical outlines
-        4. Write as if you're explaining to a fellow developer in a friendly conversation
-        5. Focus on clarity and readability over technical formalism
+        You are a codebase expert assistant. Provide detailed technical explanations using ONLY the context below.
+        Response guidelines:
+        - Keep responses concise and under 200 words total
+        - Be direct and focused on answering exactly what was asked
+        - Focus on code functionality, relationships, and structure
+        - Include only the most important implementation details
+        - Never add disclaimers or conversational fluff
+        - ALWAYS start your response with the relevant code snippet in a code block
+        - Format explanations as:
+          ```language
+          // The actual code snippet being discussed
+          ```
+          [File] → [Entity]: (IMPORTANT: Use only the base filename without any path, e.g. "main.py → function_name" not "cloned_repos/xyz/main.py → function_name")
+          - Purpose: [Concise purpose]
+          - Implementation: [Key technical details]
+          - Relationships: [Connections to other entities]
         
         {conversation_context}
         
@@ -400,13 +519,15 @@ def chat_with_graph():
         ---
         {graph_context}
         ---
-        
-        Based on this context, provide a clear, conversational, and technically accurate response that reads naturally.
-        Use plain language and avoid overly structured formatting like bullet points or numbered lists.
-        If you can't answer based on the provided context, acknowledge this limitation conversationally.
         """
         app.logger.info("Calling Generative Model (Gemini)...")
-        response = generative_model.generate_content(prompt)
+        response = generative_model.generate_content(
+            prompt,
+            generation_config={
+                # "max_output_tokens": 600,  # Increased for technical depth
+                "temperature": 0.3         # Balanced creativity
+            }
+        )
         app.logger.info("Gemini response received.")
 
         return jsonify({

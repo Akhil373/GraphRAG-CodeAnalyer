@@ -10,7 +10,7 @@ from vertexai.generative_models import GenerativeModel
 # Initialize clients (globally for better performance in Cloud Functions)
 storage_client = storage.Client()
 vertexai.init(project=os.environ.get('GCP_PROJECT_ID'), location=os.environ.get('GCP_REGION'))
-embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
+embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-large-exp-03-07")
 
 # Neo4j AuraDB connection details (get these from Aura Console)
 NEO4J_URI = os.getenv("NEO4J_URI")
@@ -58,6 +58,7 @@ def ingest_data_to_neo4j(parsed_data, session):
     filename = parsed_data.get('filename')
     entities = parsed_data.get('entities', [])
     relationships = parsed_data.get('relationships', [])
+    context_sample = parsed_data.get('context_sample', '')
 
     if not filename:
         print("Skipping ingestion: filename is missing from parsed data.")
@@ -101,11 +102,16 @@ def ingest_data_to_neo4j(parsed_data, session):
     elif file_extension in ['.html', '.xml', '.json', '.yaml', '.yml', '.csv', '.dat']:
         file_type = "DataFile"
     
-    # Create the File node with appropriate type
-    file_name = os.path.basename(filename)
+    # Create the File node with context sample
     session.run(
-        f"MERGE (f:{file_type}:File {{path: $filename}}) SET f.repo_id = $repo_id, f.name = $file_name, f.extension = $extension",
-        filename=filename, repo_id=repo_id, file_name=file_name, extension=file_extension
+        f"MERGE (f:{file_type}:File {{path: $filename}}) " 
+        "SET f.repo_id = $repo_id, f.name = $file_name, "
+        "f.extension = $extension, f.context_sample = $context_sample",
+        filename=filename, 
+        repo_id=repo_id, 
+        file_name=os.path.basename(filename), 
+        extension=file_extension,
+        context_sample=context_sample
     )
 
     # Track import files for later processing
@@ -193,6 +199,14 @@ def ingest_data_to_neo4j(parsed_data, session):
             'embedding': embedding,
             'repo_id': repo_id
         }
+        
+        # Add context_sample (code snippet) if available
+        context_sample = properties.get('context_sample', '')
+        if not context_sample and 'code' in entity:
+            context_sample = entity.get('code', '')
+        if context_sample:
+            property_params['context_sample'] = context_sample
+            property_cypher += ", e.context_sample = $context_sample"
         
         # Add original_name if available
         if properties.get('original_name'):

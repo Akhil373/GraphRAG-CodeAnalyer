@@ -88,19 +88,22 @@ class CodeParser:
                 return language
         return 'unknown'
 
-    def parse_content(self, file_path: str, content: str) -> Tuple[List[CodeEntity], List[CodeRelationship]]:
+    def parse_content(self, file_path: str, content: str) -> Tuple[List[CodeEntity], List[CodeRelationship], str]:
         """Parse the content of a single file."""
         language = self.detect_language(file_path, content)
         logger.info(f"Detected language for {file_path}: {language}")
+        
+        # Store the first 2000 characters as context sample
+        context_sample = content[:2000]
         
         ai_entities, ai_relationships = self.extract_with_ai(content, language, file_path)
         
         if not ai_entities:
             logger.info(f"AI returned no entities for {file_path}, falling back to regex.")
             regex_entities, regex_relationships = self.extract_with_regex(content, language, file_path)
-            return regex_entities, regex_relationships
+            return regex_entities, regex_relationships, context_sample
         
-        return ai_entities, ai_relationships
+        return ai_entities, ai_relationships, context_sample
 
     def extract_with_ai(self, content: str, language: str, file_path: str) -> Tuple[List[CodeEntity], List[CodeRelationship]]:
         """Extract entities and relationships using Vertex AI."""
@@ -219,7 +222,17 @@ class CodeParser:
                     for key, value in entity_data.items():
                         if key not in ['name', 'entity_type', 'description', 'properties'] and value is not None:
                             properties[key] = value
-                            
+                    
+                    # Extract code sample from the original content
+                    line_number = properties.get('line_number', 0)
+                    code_length = properties.get('code_length', 20)
+                    if line_number > 0:
+                        lines = content.split('\n')
+                        start_line = max(0, line_number - 3)
+                        end_line = min(len(lines), line_number + code_length + 3)
+                        code_sample = '\n'.join(lines[start_line:end_line])
+                        properties['context_sample'] = code_sample
+                    
                     entities.append(CodeEntity(
                         name=entity_data.get('name'),
                         entity_type=entity_data.get('entity_type'),
@@ -394,7 +407,7 @@ class CodeParser:
                     
                 # Get surrounding code for description
                 start_pos = max(0, match.start() - 100)
-                end_pos = min(len(content), match.end() + 100)
+                end_pos = min(len(content), match.end() + 200)
                 context_code = content[start_pos:end_pos]
                 
                 # Add entity with enhanced metadata
@@ -407,7 +420,7 @@ class CodeParser:
                         "original_name": name,  # Store the original name for reference
                         "line_number": line_start,
                         "code_length": line_end - line_start,
-                        "context_sample": context_code[:200] if len(context_code) > 200 else context_code,
+                        "context_sample": context_code[:500] if len(context_code) > 500 else context_code,
                         "source_file": filename
                     }
                 )
@@ -557,7 +570,7 @@ def code_parser_entrypoint(cloud_event):
             content = raw_content.decode('utf-8', errors='replace')
 
         # Parse the code
-        entities, relationships = parser.parse_content(file_name, content)
+        entities, relationships, context_sample = parser.parse_content(file_name, content)
         
         # Prepare data for upload with improved repo_id extraction
         repo_id = None
@@ -574,7 +587,8 @@ def code_parser_entrypoint(cloud_event):
             "filename": file_name,
             "original_path": file_path_from_metadata or file_name,
             "entities": [e.to_dict() for e in entities],
-            "relationships": [r.to_dict() for r in relationships]
+            "relationships": [r.to_dict() for r in relationships],
+            "context_sample": context_sample
         }
         
         # Upload results to the parsed data bucket
