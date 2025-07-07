@@ -1,5 +1,5 @@
-.env.example
-
+`.env.example`
+```
 GCP_PROJECT_ID=  
 GCP_REGION=  
 GCS_BUCKET_NAME=  
@@ -9,3 +9,4 @@ NEO4J_URI=
 NEO4J_USERNAME=  
 NEO4J_PASSWORD=  
 NEO4J_DATABASE=  
+```
