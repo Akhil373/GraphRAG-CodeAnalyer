@@ -3,6 +3,11 @@ import axios from 'axios';
 import { ThemeContext } from './ThemeContext';
 import ThemeToggle from './components/ThemeToggle';
 import './App.css';
+import Header from './components/Header';
+import WelcomeView from './components/WelcomeView';
+import LoadingView from './components/LoadingView';
+import FileSelectionView from './components/FileSelectionView';
+import ChatView from './components/ChatView';
 
 const webname = "Analyo";
 
@@ -494,326 +499,59 @@ function App() {
     });
   };
 
-  // New function to render the header
-  const renderHeader = () => (
-    <header className={`app-header ${!isHeaderVisible ? 'header-hidden' : ''}`}>
-      <div className="logo-container">
-        <h1 className="logo-text">{webname}</h1>
-      </div>
-      <div className="header-actions">
-        {uiState === 'chat' && (
-          <button 
-            className="btn btn-secondary" 
-            onClick={handleStartNewClick}
-            disabled={isClearing}
-          >
-            Start New
-          </button>
-        )}
-        <ThemeToggle />
-      </div>
-    </header>
-  );
-
-  const renderWelcomeView = () => (
-    <div className="welcome-container">
-      <h1 className="welcome-title">Welcome to <span className='logo-text' style={{"fontSize" : "inherit"}}>{webname}</span></h1>
-      <p className="welcome-subtitle">
-        Analyze, understand, and explore your codebase with AI assistance.
-        Enter a GitHub repository URL below to get started.
-      </p>
-      <form className="repo-form" onSubmit={handleSubmitRepo}>
-        <div className="repo-input-container">
-          <input
-            type="text"
-            className="repo-input"
-            value={githubUrl}
-            onChange={(e) => setGithubUrl(e.target.value)}
-            placeholder="Enter GitHub repository URL (e.g., https://github.com/username/repo)"
-            aria-label="GitHub repository URL"
-            disabled={apiState !== API_STATUS.IDLE}
-          />
-        </div>
-        <button 
-          type="submit" 
-          className="btn btn-primary w-full"
-          disabled={apiState !== API_STATUS.IDLE || !githubUrl.trim()}
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ marginRight: '0.5rem' }}>
-            <path d="M21 12L13 4V9C7 10 4 15 3 20C5.5 16.5 9 14.9 13 14.9V20L21 12Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-          </svg>
-          Analyze Repository
-        </button>
-      </form>
-    </div>
-  );
-
-  const renderLoadingView = () => (
-    <div className="loading-container">
-      <div className="spinner">
-        <div className="spinner-dot"></div>
-        <div className="spinner-dot"></div>
-        <div className="spinner-dot"></div>
-        <div className="spinner-dot"></div>
-        <div className="spinner-dot"></div>
-        <div className="spinner-dot"></div>
-        <div className="spinner-dot"></div>
-        <div className="spinner-dot"></div>
-      </div>
-      <h2>
-        {apiState === API_STATUS.FETCHING 
-          ? 'Fetching repository files...' 
-          : 'Processing selected files...'}
-      </h2>
-      
-      {apiState === API_STATUS.PROCESSING && processingProgress.total > 0 && (
-        <div className="progress-container">
-          <div className="progress-bar">
-            <div 
-              className="progress-fill" 
-              style={{ width: `${processingProgress.percentage}%` }}
-            ></div>
-          </div>
-          <p className="progress-text">
-            Processing file {processingProgress.processed} of {processingProgress.total}
-            {processingProgress.currentFile && `: ${processingProgress.currentFile}`}
-          </p>
-        </div>
-      )}
-      
-      <p>{statusMessage}</p>
-    </div>
-  );
-
-  const renderFileSelectionView = () => {
-    // Filter files based on search term
-    const filteredFiles = fileSearchTerm
-      ? files.filter(file => file.toLowerCase().includes(fileSearchTerm.toLowerCase()))
-      : files;
-    
-    // Create folder structure from files
-    const folderStructure = getFolderStructure(filteredFiles);
-    
-    return (
-      <div className="file-selection-container">
-        <div className="selection-header">
-          <h2>Select Files to Analyze</h2>
-          <div className="file-search">
-            <input
-              type="text"
-              className="repo-input"
-              placeholder="Search files..."
-              value={fileSearchTerm}
-              onChange={(e) => setFileSearchTerm(e.target.value)}
-            />
-            {fileSearchTerm && (
-              <button 
-                className="btn" 
-                onClick={() => setFileSearchTerm('')}
-                aria-label="Clear search"
-                style={{ position: 'absolute', right: '8px', top: '50%', transform: 'translateY(-50%)', padding: '4px' }}
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <path d="M18 6L6 18M6 6L18 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
-              </button>
-            )}
-          </div>
-        </div>
-        
-        {files.length === 0 && (
-          <div className="card text-center">
-            <h3>No files found in repository</h3>
-            <p>This could be due to:</p>
-            <ul style={{ textAlign: 'left', marginBottom: 'var(--space-4)' }}>
-              <li>The repository is empty</li>
-              <li>Files may be in nested directories not visible</li>
-              <li>There was an error retrieving files</li>
-            </ul>
-            <button onClick={() => setUiState('welcome')} className="btn btn-primary">
-              Go Back
-            </button>
-          </div>
-        )}
-        
-        {files.length > 0 && (
-          <>
-            <div className="file-controls">
-              <button onClick={handleSelectAll} className="btn btn-secondary">
-                {selectedFiles.size === filteredFiles.length && filteredFiles.length > 0 
-                  ? 'Deselect All' 
-                  : 'Select All'}
-              </button>
-              <span className="file-count">
-                {selectedFiles.size} file{selectedFiles.size !== 1 ? 's' : ''} selected
-              </span>
-            </div>
-            
-            <div className="file-browser">
-              {filteredFiles.length > 0 ? (
-                <ul className="file-list">
-                  {Object.keys(folderStructure).length > 0 ? (
-                    renderFolderTree(folderStructure)
-                  ) : (
-                    // Fallback to old file list if structure is empty
-                    filteredFiles.map((file, index) => (
-                      <li key={index} 
-                        className={`file-item ${selectedFiles.has(file) ? 'selected' : ''}`}
-                        onClick={() => handleFileSelect(file)}>
-                        <input
-                          type="checkbox"
-                          className="file-checkbox"
-                          id={`file-${index}`}
-                          checked={selectedFiles.has(file)}
-                          onChange={(e) => e.stopPropagation()}
-                        />
-                        <span className="file-name">{file}</span>
-                      </li>
-                    ))
-                  )}
-                </ul>
-              ) : (
-                <div className="card text-center">
-                  {fileSearchTerm ? 'No matching files found' : 'No files available'}
-                </div>
-              )}
-            </div>
-            
-            <div className="mt-auto">
-              <button 
-                onClick={handleProcessSelectedFiles} 
-                disabled={selectedFiles.size === 0}
-                className="btn btn-primary w-full"
-              >
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ marginRight: '0.5rem' }}>
-                  <path d="M9 16.2L4.8 12L3.4 13.4L9 19L21 7L19.6 5.6L9 16.2Z" fill="currentColor"/>
-                </svg>
-                Analyze {selectedFiles.size} Selected File{selectedFiles.size !== 1 ? 's' : ''}
-              </button>
-            </div>
-          </>
-        )}
-      </div>
-    );
-  };
-
-  const renderChatView = () => {
-    // Function to format code blocks
-    const formatMessage = (text) => {
-      if (!text) return '';
-      
-      // Split by code blocks
-      const parts = text.split(/```([^`]+)```/);
-      if (parts.length === 1) return text; // No code blocks
-      
-      const result = [];
-      for (let i = 0; i < parts.length; i++) {
-        if (i % 2 === 0) {
-          // Regular text - split by new lines to create proper paragraphs
-          if (parts[i].trim()) {
-            const paragraphs = parts[i].split('\n').filter(p => p.trim());
-            paragraphs.forEach((p, idx) => {
-              result.push(<p key={`${i}-${idx}`}>{p}</p>);
-            });
-          }
-        } else {
-          // Code block
-          result.push(
-            <pre key={i}>
-              <code>{parts[i]}</code>
-            </pre>
-          );
-        }
-      }
-      
-      return result.length > 0 ? result : text;
-    };
-
-    return (
-      <div className="chat-container">
-        <div className="chat-history">
-          {chatHistory.length === 0 ? (
-            <div className="card text-center" style={{margin: '2rem auto', maxWidth: '600px', padding: '2rem'}}>
-              <svg width="64" height="64" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style={{margin: '0 auto 1rem'}}>
-                <path d="M21 12C21 16.9706 16.9706 21 12 21C7.02944 21 3 16.9706 3 12C3 7.02944 7.02944 3 12 3C16.9706 3 21 7.02944 21 12Z" stroke="currentColor" strokeWidth="2"/>
-                <path d="M12 8V12L14.5 14.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                <path d="M9 17C9.85038 17.3756 10.8846 17.5 12 17.5C13.1154 17.5 14.1496 17.3756 15 17" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
-              </svg>
-              <h3 className="mb-2">Start Your Conversation</h3>
-              <p>Ask questions about your code's structure, functions, and relationships to get detailed insights.</p>
-            </div>
-          ) : (
-            chatHistory.map((msg, index) => (
-              <div 
-                key={index} 
-                className={`chat-message ${msg.sender === 'user' ? 'user-message' : 'ai-message'}`}
-              >
-                {typeof msg.text === 'string' ? formatMessage(msg.text) : msg.text}
-                <span className="message-time">
-                  {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                </span>
-              </div>
-            ))
-          )}
-          {isChatLoading && (
-            <div className="chat-message ai-message">
-              <div className="typing">
-                <span></span>
-                <span></span>
-                <span></span>
-                <span></span>
-                <span></span>
-              </div>
-            </div>
-          )}
-          <div ref={chatEndRef} />
-        </div>
-        
-        <div className="chat-input-container">
-          <form onSubmit={handleChatQuerySubmit} className="chat-form">
-            <input
-              type="text"
-              className="chat-input"
-              value={chatQuery}
-              onChange={(e) => setChatQuery(e.target.value)}
-              placeholder="Ask about your code structure, functions, relationships..."
-              disabled={isChatLoading}
-            />
-            <button 
-              type="submit" 
-              className="chat-submit-btn"
-              disabled={isChatLoading || !chatQuery.trim()}
-              aria-label="Send message"
-            >
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M22 2L11 13M22 2L15 22L11 13M22 2L2 9L11 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-              </svg>
-            </button>
-          </form>
-        </div>
-      </div>
-    );
-  };
-
   // Main render logic
   const renderContent = () => {
     switch (uiState) {
       case 'welcome':
-        return renderWelcomeView();
+        return <WelcomeView 
+          githubUrl={githubUrl}
+          setGithubUrl={setGithubUrl}
+          onSubmitRepo={handleSubmitRepo}
+          apiState={apiState}
+        />;
       case 'loading':
-        return renderLoadingView();
+        return <LoadingView 
+          apiState={apiState}
+          statusMessage={statusMessage}
+          processingProgress={processingProgress}
+        />;
       case 'file-selection':
-        return renderFileSelectionView();
+        return <FileSelectionView 
+          files={files}
+          selectedFiles={selectedFiles}
+          setSelectedFiles={setSelectedFiles}
+          fileSearchTerm={fileSearchTerm}
+          setFileSearchTerm={setFileSearchTerm}
+          onProcessSelectedFiles={handleProcessSelectedFiles}
+          statusMessage={statusMessage}
+        />;
       case 'chat':
-        return renderChatView();
+        return <ChatView 
+          chatHistory={chatHistory}
+          chatQuery={chatQuery}
+          setChatQuery={setChatQuery}
+          onSubmitChatQuery={handleChatQuerySubmit}
+          isChatLoading={isChatLoading}
+          chatEndRef={chatEndRef}
+        />;
       default:
-        return renderWelcomeView();
+        return <WelcomeView 
+          githubUrl={githubUrl}
+          setGithubUrl={setGithubUrl}
+          onSubmitRepo={handleSubmitRepo}
+          apiState={apiState}
+        />;
     }
   };
 
   return (
     <div className="app-container">
-      {renderHeader()}
+      <Header 
+        uiState={uiState} 
+        onStartNew={handleStartNewClick} 
+        isClearing={isClearing} 
+      />
+      
       <main className="main-content">
         {renderContent()}
       </main>
