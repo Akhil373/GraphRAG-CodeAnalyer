@@ -1,16 +1,10 @@
-set in both backend terminal and backend/rag_api_service terminal 
+.env.example
+GCP_PROJECT_ID=
+GCP_REGION=
+GCS_BUCKET_NAME=
+PARSED_DATA_BUCKET=
 
-$env:GCP_PROJECT_ID=""
-$env:GCP_REGION=""
-$env:NEO4J_URI=""
-$env:NEO4J_USERNAME=""
-$env:NEO4J_PASSWORD=""
-
------------------------------------------------------------------------
-
-ECHO:
-echo $env:GCP_PROJECT_ID
-echo $env:GCP_REGION
-echo $env:NEO4J_URI
-echo $env:NEO4J_USERNAME   
-echo $env:NEO4J_PASSWORD
+NEO4J_URI=
+NEO4J_USERNAME=
+NEO4J_PASSWORD=
+NEO4J_DATABASE=
