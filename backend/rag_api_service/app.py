@@ -9,35 +9,28 @@ import vertexai
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.generative_models import GenerativeModel
 from google.api_core.exceptions import GoogleAPIError
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- Flask App Initialization ---
 app = Flask(__name__)
-CORS(app) # Enable CORS for all routes
+CORS(app)
 
-# --- Logging Configuration ---
-# Set up a basic logger for the Flask app
-# In a production environment, you'd configure this more robustly
-# (e.g., to write to files, send to a log aggregation service)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
 app.logger.info("Flask app starting up...")
 
-# --- Environment Variable Validation and Global Initializations ---
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 GCP_REGION = os.getenv("GCP_REGION")
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 
-# Log Neo4j connection info (mask password)
 app.logger.info(f"Neo4j URI: {NEO4J_URI}, Username: {NEO4J_USERNAME}")
 
-# Validate environment variables critical for startup
 if not GCP_PROJECT_ID:
     app.logger.critical("GCP_PROJECT_ID environment variable not set. Exiting.")
-    exit(1) # Exit if critical config is missing
+    exit(1)
 if not GCP_REGION:
     app.logger.critical("GCP_REGION environment variable not set. Exiting.")
     exit(1)
@@ -51,36 +44,29 @@ if not NEO4J_PASSWORD:
     app.logger.critical("NEO4J_PASSWORD environment variable not set. Exiting.")
     exit(1)
 
-# Initialize Vertex AI
 try:
     vertexai.init(project=GCP_PROJECT_ID, location="us-central1")
     embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-large-exp-03-07")
-    generative_model = GenerativeModel("gemini-2.5-flash")
+    generative_model = GenerativeModel("gemini-2.5-pro")
     app.logger.info(f"Vertex AI initialized for project '{GCP_PROJECT_ID}' in region '{GCP_REGION}'.")
 except GoogleAPIError as e:
     app.logger.critical(f"Failed to initialize Vertex AI or load models: {e}", exc_info=True)
-    exit(1) # Exit if Vertex AI initialization fails (critical dependency)
+    exit(1)
 except Exception as e:
     app.logger.critical(f"An unexpected error occurred during Vertex AI initialization: {e}", exc_info=True)
     exit(1)
 
-# Neo4j connection - Initialized once globally
 neo4j_driver = None
 
 def get_neo4j_driver():
-    """
-    Returns a singleton Neo4j driver instance.
-    Establishes a plain connection using the provided URI and credentials.
-    """
     global neo4j_driver
     if neo4j_driver is None:
         try:
             neo4j_driver = GraphDatabase.driver(
                 NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
             )
-            neo4j_driver.verify_connectivity() # Test the connection
+            neo4j_driver.verify_connectivity()
             app.logger.info("Neo4j driver initialized and connected successfully.")
-            # Ensure GDS vector indexes exist
             create_vector_indexes(neo4j_driver)
         except ServiceUnavailable as e:
             app.logger.critical(
@@ -95,19 +81,8 @@ def get_neo4j_driver():
     return neo4j_driver
 
 def create_vector_indexes(driver):
-    """
-    Ensure that the required GDS vector indexes exist **and** are configured with
-    the correct dimensionality for the current embedding model. If an index
-    already exists but its configured `vector.dimensions` does not match the
-    expected size (3072), the index will be dropped and recreated with the
-    correct settings. This prevents runtime errors such as:
-        "Index query vector has 3072 dimensions, but indexed vectors have 768."
-    """
-
-    # Desired dimensionality based on the active embedding model
     desired_dim = 3072
 
-    # Cypher templates to (re)create the indexes
     index_creation_queries = {
         "file_index": f"""
             CREATE VECTOR INDEX `file_index` IF NOT EXISTS
@@ -128,17 +103,24 @@ def create_vector_indexes(driver):
                     `vector.similarity_function`: 'cosine'
                 }}
             }}
+        """,
+        "operation_index": f"""
+            CREATE VECTOR INDEX `operation_index` IF NOT EXISTS
+            FOR (op:Operation) ON (op.embedding)
+            OPTIONS {{
+                indexConfig: {{
+                    `vector.dimensions`: {desired_dim},
+                    `vector.similarity_function`: 'cosine'
+                }}
+            }}
         """
     }
 
     try:
         with driver.session() as session:
-            # First, try to drop existing indexes to ensure clean recreation
             try:
-                # Use SHOW INDEXES command which is supported in AuraDB
-                existing_indexes = session.run("SHOW INDEXES WHERE name in ['file_index', 'function_index']").data()
+                existing_indexes = session.run("SHOW INDEXES WHERE name in ['file_index', 'function_index', 'operation_index']").data()
                 
-                # Drop existing indexes if they exist
                 for index in existing_indexes:
                     index_name = index.get('name')
                     if index_name:
@@ -147,7 +129,6 @@ def create_vector_indexes(driver):
             except Exception as e:
                 app.logger.warning(f"Could not check or drop existing indexes: {e}")
                 
-            # Create new indexes with the correct dimensions
             for index_name, create_query in index_creation_queries.items():
                 app.logger.info(f"Creating vector index '{index_name}' with dimension {desired_dim}...")
                 session.run(create_query)
@@ -162,7 +143,6 @@ def create_vector_indexes(driver):
     except Exception as e:
         app.logger.error("An unexpected error occurred during index creation: %s", e, exc_info=True)
 
-# --- Global Error Handlers ---
 @app.errorhandler(400)
 def handle_bad_request(e):
     app.logger.error(f"Bad Request (400): {e.description}", exc_info=True)
@@ -201,7 +181,6 @@ def handle_google_api_error(e):
 
 @app.errorhandler(Exception)
 def handle_generic_error(e):
-    # This is a catch-all for any unhandled exceptions
     app.logger.error(f"An unhandled internal server error occurred: {e}", exc_info=True)
     return jsonify({
         "status": 500,
@@ -210,7 +189,6 @@ def handle_generic_error(e):
     }), 500
 
 
-# --- Helper Functions ---
 def generate_embeddings(text):
     """Generates embeddings for a given text using Vertex AI."""
     if not text:
@@ -221,7 +199,7 @@ def generate_embeddings(text):
         return embeddings[0].values
     except Exception as e:
         app.logger.error(f"Vertex AI embedding model error: {e}", exc_info=True)
-        raise # Re-raise to be caught by the higher-level error handler
+        raise
 
 def retrieve_graph_context(query_embedding, user_query, session):
     """
@@ -230,9 +208,90 @@ def retrieve_graph_context(query_embedding, user_query, session):
     context = []
     
     try:
+        # --- Special query handling for file operations ---
+        # Check if the query is asking about operations in a specific file
+        file_operations_pattern = re.compile(r'what (?:operations|functions|can|does).*(?:in|with) (\w+\.[a-zA-Z]+)', re.IGNORECASE)
+        file_match = file_operations_pattern.search(user_query)
+        
+        explain_operation_pattern = re.compile(r'explain\s+([a-zA-Z0-9_\s]+)\s+(?:operation|function|code)?\s+in\s+(\w+\.[a-zA-Z]+)', re.IGNORECASE)
+        explain_match = explain_operation_pattern.search(user_query)
+        
+        if file_match:
+            file_name = file_match.group(1)
+            app.logger.info(f"Detected file operations query for: {file_name}")
+            
+            # Get all operations in this file
+            operations_query = """
+            MATCH (f:File)-[:CONTAINS_OPERATION]->(o:Operation)
+            WHERE f.name = $file_name OR f.path ENDS WITH $file_name
+            RETURN o.name AS name, o.description AS description, o.code_snippet AS code
+            ORDER BY o.name
+            """
+            operations = session.run(operations_query, file_name=file_name).data()
+            
+            if operations:
+                context.append(f"Operations available in {file_name}:")
+                for i, op in enumerate(operations):
+                    context.append(f"{i+1}. {op.get('description', op.get('name', 'Unnamed operation'))}")
+                return "\n".join(context)
+        
+        # Handle "explain X operation in Y file" queries
+        elif explain_match:
+            operation_name = explain_match.group(1).strip().lower()
+            file_name = explain_match.group(2)
+            app.logger.info(f"Detected explain operation query: {operation_name} in {file_name}")
+            
+            # Get specific operation by description or name
+            operation_query = """
+            MATCH (f:File)-[:CONTAINS_OPERATION]->(o:Operation)
+            WHERE (f.name = $file_name OR f.path ENDS WITH $file_name) AND
+                  (toLower(o.name) CONTAINS $operation_name OR
+                   toLower(o.description) CONTAINS $operation_name)
+            RETURN o.name AS name, o.description AS description, o.code_snippet AS code
+            LIMIT 1
+            """
+            operation = session.run(operation_query, file_name=file_name, operation_name=operation_name).single()
+            
+            if operation:
+                code = operation.get('code')
+                if code:
+                    context.append(f"Here is the code for '{operation.get('description', operation.get('name'))}':")
+                    context.append(f"```c\n{code}\n```")
+                    return "\n".join(context)
+            
+            # Try to find any function that matches the description
+            function_query = """
+            MATCH (f:File)-[:CONTAINS]->(func:Function)
+            WHERE (f.name = $file_name OR f.path ENDS WITH $file_name) AND
+                  (toLower(func.name) CONTAINS $operation_name OR
+                   toLower(func.description) CONTAINS $operation_name)
+            RETURN func.name AS name, func.description AS description, func.context_sample AS code
+            LIMIT 1
+            """
+            function = session.run(function_query, file_name=file_name, operation_name=operation_name).single()
+            
+            if function:
+                code = function.get('code')
+                if code:
+                    context.append(f"Here is the function '{function.get('name')}' that matches your query:")
+                    context.append(f"```c\n{code}\n```")
+                    return "\n".join(context)
+        
         # --- 1. Vector Search (Primary Method) ---
         app.logger.info("Executing entity vector search query...")
         
+        # Search operation index first
+        operation_query = """
+        CALL db.index.vector.queryNodes('operation_index', 5, $query_embedding) YIELD node, score
+        WHERE score > 0.6
+        RETURN node.name AS name, 'Operation' as type, node.file_path AS filePath,
+               node.description as description, node.code_snippet as code, score
+        ORDER BY score DESC
+        """
+        operation_results = session.run(operation_query, query_embedding=query_embedding).data()
+        if operation_results:
+            app.logger.info(f"Found {len(operation_results)} relevant operations via vector search")
+            
         # Search function index
         function_query = """
         CALL db.index.vector.queryNodes('function_index', 5, $query_embedding) YIELD node, score
@@ -253,8 +312,8 @@ def retrieve_graph_context(query_embedding, user_query, session):
         """
         file_results = session.run(file_query, query_embedding=query_embedding).data()
         
-        # Combine results
-        entity_results = function_results + file_results
+        # Combine results, prioritizing operations
+        entity_results = operation_results + function_results + file_results
         entity_ids = [f"{res['name']}-{res['filePath']}" for res in entity_results]
         
         for res in entity_results:
@@ -265,7 +324,11 @@ def retrieve_graph_context(query_embedding, user_query, session):
             # Include code sample if available
             code_sample = res.get('code', '')
             if code_sample:
-                context.append(f"In file '{file_path}', there is a {entity_type.lower()} called '{res['name']}'. {description}\nCode:\n```\n{code_sample}\n```")
+                if entity_type.lower() == 'operation':
+                    # Format operations differently to highlight them
+                    context.append(f"Operation in file '{file_path}': {description}\nCode:\n```\n{code_sample}\n```")
+                else:
+                    context.append(f"In file '{file_path}', there is a {entity_type.lower()} called '{res['name']}'. {description}\nCode:\n```\n{code_sample}\n```")
             else:
                 context.append(f"In file '{file_path}', there is a {entity_type.lower()} called '{res['name']}'. {description}")
         
@@ -450,6 +513,183 @@ def retrieve_graph_context(query_embedding, user_query, session):
     else:
         return "\n".join(context)
 
+def retrieve_file_specific_context(query_embedding, user_query, repo_id, file_path, session, context_json=None):
+    """
+    Retrieves relevant context from the Neo4j graph, focused specifically on the selected file.
+    It first attempts a vector search for the most relevant code sections. If found, it returns
+    a focused context. Otherwise, it falls back to a general context of all entities in the file.
+    """
+    context = []
+    
+    try:
+        # --- 1. Vector Search First ---
+        # Attempt to find the most relevant code snippets in the file to provide a focused context.
+        vector_query = """
+        MATCH (f:File {repo_id: $repo_id, path: $file_path})-[:CONTAINS]->(e)
+        WHERE e:Function OR e:Class OR e:Operation
+        WITH e
+        CALL db.index.vector.queryNodes(CASE 
+            WHEN e:Function THEN 'function_index' 
+            WHEN e:Operation THEN 'operation_index'
+            ELSE '' END, 
+            3, $embedding) YIELD node, score
+        WHERE node = e AND score > 0.7
+        RETURN e, score
+        ORDER BY score DESC
+        LIMIT 3
+        """
+        
+        vector_results = session.run(vector_query, 
+                                     repo_id=repo_id, 
+                                     file_path=file_path,
+                                     embedding=query_embedding).data()
+        
+        # --- 2. Build Context Based on Search Results ---
+        if vector_results:
+            app.logger.info(f"Found {len(vector_results)} relevant sections via vector search. Building focused context.")
+            context.append(f"FILE: {file_path}")
+            
+            # Add the general file code sample if available
+            if context_json:
+                try:
+                    file_data = json.loads(context_json)
+                    if file_data.get('context_sample'):
+                        context.append(f"CODE SAMPLE:\n```{file_data.get('language', '')}\n{file_data['context_sample'][:1000]}\n```\n")
+                except json.JSONDecodeError:
+                    app.logger.error("Could not parse provided context JSON for focused view.")
+
+            context.append("\nMOST RELEVANT CODE SECTIONS:")
+            for result in vector_results:
+                entity = result.get('e')
+                score = result.get('score', 0)
+                if entity:
+                    entity_data = dict(entity)
+                    entity_type = "Unknown"
+                    if hasattr(entity, 'labels'):
+                        entity_type = list(entity.labels)[0] if entity.labels else "Unknown"
+                    elif isinstance(entity, dict) and entity.get('labels'):
+                        entity_type = entity.get('labels')[0] if entity.get('labels') else "Unknown"
+                    
+                    context.append(f"\n- {entity_type}: {entity_data.get('name', 'Unnamed')} (Relevance: {score:.2f})")
+                    if entity_data.get('description'):
+                        context.append(f"  DESCRIPTION: {entity_data.get('description')}")
+                    
+                    # Get code snippet from properties based on entity type
+                    if entity_type == "Function" or entity_type == "Class":
+                        if entity_data.get('context_sample'):
+                            context.append(f"  CODE SNIPPET:\n```\n{entity_data.get('context_sample')[:1000]}\n```\n")
+                    elif entity_type == "Operation":
+                        if entity_data.get('code_snippet'):
+                            context.append(f"  CODE SNIPPET:\n```\n{entity_data.get('code_snippet')[:1000]}\n```\n")
+            
+            # Return the focused context immediately
+            return "\n".join(context)
+
+        # --- 3. Fallback to General Context ---
+        # If no highly relevant snippets are found, build a general context of the file.
+        else:
+            app.logger.info("No high-relevance sections found via vector search. Building general file context.")
+            # If context_json is provided, we can use it directly
+            if context_json:
+                try:
+                    file_data = json.loads(context_json)
+                    # Format the context data
+                    context.append(f"FILE: {file_path}")
+                    if file_data.get('language'):
+                        context.append(f"LANGUAGE: {file_data['language']}")
+                    if file_data.get('context_sample'):
+                        context.append(f"CODE SAMPLE:\n```{file_data['language']}\n{file_data['context_sample'][:1000]}\n```\n")
+                except json.JSONDecodeError:
+                    app.logger.error("Could not parse provided context JSON")
+            
+            # Query for entities directly related to this file
+            file_query = """
+            MATCH (f:File {repo_id: $repo_id, path: $file_path})
+            OPTIONAL MATCH (f)-[r]->(e)
+            RETURN type(r) as relationship_type, e
+            LIMIT 30
+            """
+            
+            file_results = session.run(file_query, repo_id=repo_id, file_path=file_path).data()
+            
+            if file_results:
+                # Group entities by relationship type
+                entities_by_type = {}
+                for result in file_results:
+                    rel_type = result.get('relationship_type')
+                    entity = result.get('e')
+                    
+                    if rel_type and entity:
+                        if rel_type not in entities_by_type:
+                            entities_by_type[rel_type] = []
+                        
+                        # Format the entity data
+                        entity_data = dict(entity)
+                        entity_type = "Unknown"
+                        
+                        # Check if entity is a Neo4j Node object or a dict
+                        if hasattr(entity, 'labels'):
+                            entity_type = list(entity.labels)[0] if entity.labels else "Unknown"
+                        elif isinstance(entity, dict) and entity.get('labels'):
+                            entity_type = entity.get('labels')[0] if entity.get('labels') else "Unknown"
+                        
+                        entities_by_type[rel_type].append({
+                            "type": entity_type,
+                            "data": entity_data
+                        })
+                
+                # Format the context by relationship type
+                for rel_type, entities in entities_by_type.items():
+                    context.append(f"\n{rel_type.upper()} RELATIONSHIPS:")
+                    for entity in entities:
+                        entity_type = entity["type"]
+                        entity_data = entity["data"]
+                        
+                        if entity_type == "Function":
+                            context.append(f"- FUNCTION: {entity_data.get('name', 'Unnamed')}")
+                            if entity_data.get('description'):
+                                context.append(f"  DESCRIPTION: {entity_data.get('description')}")
+                            if entity_data.get('params'):
+                                context.append(f"  PARAMETERS: {str(entity_data.get('params'))}")
+                            if entity_data.get('return_type'):
+                                context.append(f"  RETURN TYPE: {str(entity_data.get('return_type'))}")
+                            if entity_data.get('context_sample'):
+                                context.append(f"  CODE SNIPPET:\n```\n{entity_data.get('context_sample')[:500]}\n```\n")
+                        
+                        elif entity_type == "Variable":
+                            context.append(f"- VARIABLE: {entity_data.get('name', 'Unnamed')}")
+                            if entity_data.get('description'):
+                                context.append(f"  DESCRIPTION: {entity_data.get('description')}")
+                            if entity_data.get('data_type'):
+                                context.append(f"  TYPE: {str(entity_data.get('data_type'))}")
+                        
+                        elif entity_type == "Class":
+                            context.append(f"- CLASS: {entity_data.get('name', 'Unnamed')}")
+                            if entity_data.get('description'):
+                                context.append(f"  DESCRIPTION: {entity_data.get('description')}")
+                            if entity_data.get('fields'):
+                                context.append(f"  FIELDS: {str(entity_data.get('fields'))}")
+                            if entity_data.get('context_sample'):
+                                context.append(f"  CODE SNIPPET:\n```\n{entity_data.get('context_sample')[:500]}\n```\n")
+                        
+                        elif entity_type == "Operation":
+                            context.append(f"- OPERATION: {entity_data.get('name', 'Unnamed')}")
+                            if entity_data.get('description'):
+                                context.append(f"  DESCRIPTION: {entity_data.get('description')}")
+                            if entity_data.get('code_snippet'):
+                                context.append(f"  CODE SNIPPET:\n```\n{entity_data.get('code_snippet')[:500]}\n```\n")
+                        
+                        else:
+                            # For other entity types
+                            context.append(f"- {entity_type}: {entity_data.get('name', 'Unnamed')}")
+                            if entity_data.get('description'):
+                                context.append(f"  DESCRIPTION: {entity_data.get('description')}")
+
+    except Exception as e:
+        app.logger.error(f"Error retrieving file-specific context: {e}", exc_info=True)
+    
+    return "\n".join(context)
+
 # --- API Endpoints ---
 @app.route('/api/chat', methods=['POST'])
 def chat_with_graph():
@@ -457,6 +697,10 @@ def chat_with_graph():
     data = request.json
     user_query = data.get('query')
     conversation_history = data.get('history', [])
+    repo_id = data.get('repo_id')
+    file_path = data.get('file_path')
+    context_json = data.get('context')
+    is_repo_context = data.get('is_repo_context', False)
 
     if not user_query:
         app.logger.warning("Chat query received with no 'query' field.")
@@ -475,9 +719,20 @@ def chat_with_graph():
             }), 500
 
         with driver.session() as session:
-            app.logger.info("Retrieving graph context...")
-            graph_context = retrieve_graph_context(query_embedding, user_query, session)
-            app.logger.info(f"Graph context retrieved: {'Context found' if graph_context else 'No context found'}")
+            app.logger.info("Retrieving context...")
+            
+            # Determine which context retrieval method to use based on the request
+            if is_repo_context:
+                app.logger.info(f"Using repository-wide context for repo_id: {repo_id}")
+                graph_context = retrieve_graph_context(query_embedding, user_query, session)
+            elif file_path and repo_id:
+                app.logger.info(f"Using file-specific context for {file_path}")
+                graph_context = retrieve_file_specific_context(query_embedding, user_query, repo_id, file_path, session, context_json)
+            else:
+                app.logger.info("Using general graph context as fallback")
+                graph_context = retrieve_graph_context(query_embedding, user_query, session)
+                
+            app.logger.info(f"Context retrieved: {'Context found' if graph_context else 'No context found'}")
 
             # Print the human-readable context to the terminal
             print("\n===== Context sent to Gemini =====\n")
@@ -493,33 +748,87 @@ def chat_with_graph():
                 content = msg.get('content', '')
                 conversation_context += f"{role.capitalize()}: {content}\n"
             
-        prompt = f"""
-        You are a codebase expert assistant. Provide detailed technical explanations using ONLY the context below.
-        Response guidelines:
-        - Keep responses concise and under 200 words total
-        - Be direct and focused on answering exactly what was asked
-        - Focus on code functionality, relationships, and structure
-        - Include only the most important implementation details
-        - Never add disclaimers or conversational fluff
-        - ALWAYS start your response with the relevant code snippet in a code block
-        - Format explanations as:
-          ```language
-          // The actual code snippet being discussed
-          ```
-          [File] → [Entity]: (IMPORTANT: Use only the base filename without any path, e.g. "main.py → function_name" not "cloned_repos/xyz/main.py → function_name")
-          - Purpose: [Concise purpose]
-          - Implementation: [Key technical details]
-          - Relationships: [Connections to other entities]
-        
-        {conversation_context}
-        
-        User Question: {user_query}
-        
-        Context from Knowledge Graph:
-        ---
-        {graph_context}
-        ---
-        """
+        # Customize the prompt based on context mode
+        if is_repo_context:
+            prompt = f"""
+            You are a codebase expert assistant. Provide detailed technical explanations about the entire repository using ONLY the context below.
+            Response guidelines:
+            - Keep responses concise and under 300 words total
+            - Be direct and focused on answering exactly what was asked
+            - Focus on the repository's architecture, key components, and relationships between files
+            - Provide cross-file insights and high-level understanding
+            - Include only the most important implementation details
+            - Never add disclaimers or conversational fluff
+            - If referring to code snippets, always include them in a code block
+            - Format code as:
+              ```
+              // The actual code snippet being discussed
+              ```
+            
+            {conversation_context}
+            
+            User Question: {user_query}
+            
+            Repository Context:
+            ---
+            {graph_context}
+            ---
+            """
+        elif file_path:
+            prompt = f"""
+            You are a codebase expert assistant. Provide detailed technical explanations about the file {file_path} using ONLY the context below.
+            Response guidelines:
+            - Keep responses concise and under 200 words total
+            - Be direct and focused on answering exactly what was asked
+            - Focus specifically on the selected file's code functionality, relationships, and structure
+            - Only refer to entities that are directly related to this file
+            - Include only the most important implementation details
+            - Never add disclaimers or conversational fluff
+            - If referring to code snippets, always include them in a code block
+            - Format code as:
+              ```
+              // The actual code snippet being discussed
+              ```
+            
+            {conversation_context}
+            
+            User Question: {user_query}
+            
+            Context about file {file_path}:
+            ---
+            {graph_context}
+            ---
+            """
+        else:
+            prompt = f"""
+            You are a codebase expert assistant. Provide detailed technical explanations using ONLY the context below.
+            Response guidelines:
+            - Keep responses concise and under 200 words total
+            - Be direct and focused on answering exactly what was asked
+            - Focus on code functionality, relationships, and structure
+            - Include only the most important implementation details
+            - Never add disclaimers or conversational fluff
+            - ALWAYS start your response with the relevant code snippet in a code block
+            - Format explanations as:
+                ```language
+                // The actual code snippet being discussed
+                ```
+                
+                [File] → [Entity]: (IMPORTANT: Use only the base filename without any path, e.g. "main.py → function_name" not "cloned_repos/xyz/main.py → function_name")
+                - Purpose: [Concise purpose]
+                - Implementation: [Key technical details]
+                - Relationships: [Connections to other entities]
+            
+            {conversation_context}
+            
+            User Question: {user_query}
+            
+            Context from Knowledge Graph:
+            ---
+            {graph_context}
+            ---
+            """
+            
         app.logger.info("Calling Generative Model (Gemini)...")
         response = generative_model.generate_content(
             prompt,
@@ -531,21 +840,19 @@ def chat_with_graph():
         app.logger.info("Gemini response received.")
 
         return jsonify({
+            "success": True,
             "response": response.text,
             "context_used": graph_context
         })
 
     except ConnectionError:
-        # This will be caught by the @app.errorhandler(ConnectionError)
         app.logger.error("Chat API failed due to database connection issue.", exc_info=True)
         raise
     except GoogleAPIError:
-        # This will be caught by the @app.errorhandler(GoogleAPIError)
         app.logger.error("Chat API failed due to Google API issue.", exc_info=True)
         raise
     except Exception as e:
         app.logger.error(f"An unexpected error occurred in /api/chat: {e}", exc_info=True)
-        # This will be caught by the @app.errorhandler(Exception)
         raise
 
 @app.route('/healthz', methods=['GET'])
@@ -618,6 +925,173 @@ def clear_database():
         return jsonify({
             "success": False, 
             "message": f"Unexpected error: {str(e)}"
+        }), 500
+@app.route('/api/graph/files', methods=['GET'])
+@app.route('/graph/files', methods=['GET'])
+def get_files():
+    """Get all files from Neo4j for a specific repo"""
+    repo_id = request.args.get('repo_id')
+    
+    if not repo_id:
+        return jsonify({'success': False, 'message': 'Repository ID is required'}), 400
+        
+    try:
+        driver = get_neo4j_driver()
+        with driver.session() as session:
+            # Debug: First check what file nodes exist
+            debug_query = """
+            MATCH (f:File) 
+            RETURN f.repo_id, f.path, f.name, labels(f) as labels
+            LIMIT 10
+            """
+            debug_result = session.run(debug_query).data()
+            app.logger.info(f"Debug - Found {len(debug_result)} file nodes: {debug_result}")
+            
+            # Try multiple query patterns to find files
+            queries_to_try = [
+                # Original query
+                """
+                MATCH (f:File {repo_id: $repo_id})
+                RETURN f.path AS path, f.name AS name
+                ORDER BY f.path
+                """,
+                # Try with file_path property instead of path
+                """
+                MATCH (f:File {repo_id: $repo_id})
+                RETURN COALESCE(f.path, f.file_path) AS path, f.name AS name
+                ORDER BY path
+                """,
+                # Try matching repo_id as substring
+                """
+                MATCH (f:File) 
+                WHERE f.repo_id CONTAINS $repo_id OR $repo_id CONTAINS f.repo_id
+                RETURN COALESCE(f.path, f.file_path) AS path, f.name AS name
+                ORDER BY path
+                """,
+                # Try with different file type labels
+                """
+                MATCH (f) 
+                WHERE (f:File OR f:SourceFile OR f:PythonModule OR f:DataFile) 
+                AND (f.repo_id = $repo_id OR f.repo_id CONTAINS $repo_id OR $repo_id CONTAINS f.repo_id)
+                RETURN COALESCE(f.path, f.file_path) AS path, COALESCE(f.name, f.path) AS name
+                ORDER BY path
+                """
+            ]
+            
+            files = []
+            for i, query in enumerate(queries_to_try):
+                try:
+                    result = session.run(query, repo_id=repo_id).data()
+                    app.logger.info(f"Query {i+1} returned {len(result)} results")
+                    if result:
+                        files = [{'path': file['path'], 'name': file['name']} for file in result if file['path']]
+                        break
+                except Exception as e:
+                    app.logger.warning(f"Query {i+1} failed: {e}")
+            
+            return jsonify({
+                'success': True,
+                'files': files
+            })
+            
+    except Exception as e:
+        app.logger.error(f"Error retrieving files from Neo4j: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'message': f"Failed to retrieve files: {str(e)}"
+        }), 500
+        
+@app.route('/api/graph/file-graph', methods=['GET'])
+@app.route('/graph/file-graph', methods=['GET'])
+def get_file_graph():
+    """Get graph data for visualization of a specific file and its relationships"""
+    repo_id = request.args.get('repo_id')
+    file_path = request.args.get('file_path')
+    
+    if not repo_id or not file_path:
+        return jsonify({'success': False, 'message': 'Repository ID and file path are required'}), 400
+    
+    try:
+        driver = get_neo4j_driver()
+        with driver.session() as session:
+            # Query for file and its neighborhood (2 hops)
+            query = """
+            MATCH (file:File {repo_id: $repo_id, path: $file_path})
+            CALL {
+                WITH file
+                MATCH (file)-[r1]-(n1)
+                OPTIONAL MATCH (n1)-[r2]-(n2)
+                WHERE n2 <> file
+                RETURN n1, r1, n2, r2
+            }
+            RETURN 
+                collect(DISTINCT file) + collect(DISTINCT n1) + collect(DISTINCT n2) AS nodes,
+                collect(DISTINCT r1) + collect(DISTINCT r2) AS relationships
+            """
+            result = session.run(query, repo_id=repo_id, file_path=file_path).single()
+            
+            if not result:
+                return jsonify({
+                    'success': False,
+                    'message': 'File not found or has no relationships'
+                }), 404
+            
+            # Process nodes
+            nodes = []
+            node_ids = set()
+            
+            for node in result['nodes']:
+                if node and node.id not in node_ids:
+                    node_ids.add(node.id)
+                    node_data = dict(node.items())
+                    labels = list(node.labels)
+                    
+                    # Use the primary label as the node type
+                    node_type = labels[0] if labels else 'Unknown'
+                    
+                    # Create a good display label
+                    if 'name' in node_data:
+                        label = node_data['name']
+                    elif 'path' in node_data:
+                        label = node_data['path'].split('/')[-1]
+                    else:
+                        label = f"Node-{node.id}"
+                    
+                    nodes.append({
+                        'id': str(node.id),
+                        'label': label,
+                        'type': node_type,
+                        'properties': node_data
+                    })
+            
+            # Process relationships
+            links = []
+            rel_ids = set()
+            
+            for rel in result['relationships']:
+                if rel and rel.id not in rel_ids:
+                    rel_ids.add(rel.id)
+                    links.append({
+                        'id': str(rel.id),
+                        'source': str(rel.start_node.id),
+                        'target': str(rel.end_node.id),
+                        'type': rel.type,
+                        'label': rel.type.replace('_', ' ')
+                    })
+            
+            return jsonify({
+                'success': True,
+                'graphData': {
+                    'nodes': nodes,
+                    'links': links
+                }
+            })
+    
+    except Exception as e:
+        app.logger.error(f"Error retrieving graph data from Neo4j: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'message': f"Failed to retrieve graph data: {str(e)}"
         }), 500
 
 # --- Main Execution Block ---
